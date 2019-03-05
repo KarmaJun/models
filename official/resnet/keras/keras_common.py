@@ -25,6 +25,8 @@ import numpy as np
 # pylint: disable=g-bad-import-order
 from absl import flags
 import tensorflow as tf
+
+from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.keras.optimizer_v2 import (gradient_descent as
                                                   gradient_descent_v2)
 
@@ -49,6 +51,7 @@ class TimeHistory(tf.keras.callbacks.Callback):
 
     Args:
       batch_size: Total batch size.
+      log_steps: Interval of time history logs.
 
     """
     self.batch_size = batch_size
@@ -126,6 +129,23 @@ class LearningRateBatchScheduler(tf.keras.callbacks.Callback):
           'change learning rate to %s.', self.epochs, batch, lr)
 
 
+def get_config_proto():
+  """Return config proto according to flag settings, or None to use default."""
+  config = None
+  if FLAGS.enable_xla:
+    # TODO(haoyuzhang): Remove this monkey patch when XLA OOM issue is fixed.
+    _monkey_patch_org_assert_broadcastable()
+
+    config = tf.ConfigProto()
+    config.graph_options.optimizer_options.global_jit_level = (
+        tf.OptimizerOptions.ON_2)
+    # Disable PinToHostOptimizer in grappler when enabling XLA because it causes
+    # OOM and performance regression.
+    config.graph_options.rewrite_options.pin_to_host_optimization = (
+        rewriter_config_pb2.RewriterConfig.OFF)
+  return config
+
+
 def get_optimizer():
   """Returns optimizer to use."""
   # The learning_rate is overwritten at the beginning of each step by callback.
@@ -189,8 +209,13 @@ def build_stats(history, eval_output, time_callback):
 
 
 def define_keras_flags():
+  """Define flags for Keras models."""
   flags.DEFINE_boolean(name='enable_eager', default=False, help='Enable eager?')
   flags.DEFINE_boolean(name='skip_eval', default=False, help='Skip evaluation?')
+  flags.DEFINE_boolean(
+      name='enable_xla', default=False,
+      help='Whether to enable XLA auto jit compilation. This is still an '
+      'experimental feature, and is not yet effective with TF 2.0.')
   flags.DEFINE_integer(
       name='train_steps', default=None,
       help='The number of steps to run for training. If it is larger than '
@@ -273,3 +298,26 @@ class DummyContextManager(object):
 
   def __exit__(self, *args):
     pass
+
+
+def _monkey_patch_org_assert_broadcastable():
+  """Monkey-patch `assert_broadcast` op to avoid OOM when enabling XLA."""
+  def no_op_assert_broadcastable(weights, values):
+    del weights, values
+    tf.compat.v1.logging.info(
+        'Using monkey-patched version of assert_broadcastable op, which always '
+        'returns an no_op. It should be removed after XLA OOM issue is fixed.')
+    return tf.constant([], dtype=tf.float32)
+
+  from tensorflow.python.ops import weights_broadcast_ops  # pylint: disable=g-import-not-at-top
+  if not hasattr(weights_broadcast_ops, 'org_assert_broadcastable'):
+    weights_broadcast_ops.org_assert_broadcastable = (
+        weights_broadcast_ops.assert_broadcastable)
+  weights_broadcast_ops.assert_broadcastable = no_op_assert_broadcastable
+
+
+def _undo_monkey_patch_org_assert_broadcastable():
+  from tensorflow.python.ops import weights_broadcast_ops  # pylint: disable=g-import-not-at-top
+  if hasattr(weights_broadcast_ops, 'org_assert_broadcastable'):
+    weights_broadcast_ops.assert_broadcastable = (
+        weights_broadcast_ops.org_assert_broadcastable)
