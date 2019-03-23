@@ -28,6 +28,7 @@ from official.resnet.keras import resnet_model
 from official.utils.flags import core as flags_core
 from official.utils.logs import logger
 from official.utils.misc import distribution_utils
+from official.utils.misc import model_helpers
 
 
 LR_SCHEDULE = [    # (multiplier, epoch to start) tuples
@@ -90,21 +91,26 @@ def run(flags_obj):
   Returns:
     Dictionary of training and eval stats.
   """
-  config = keras_common.get_config_proto()
   # TODO(tobyboyd): Remove eager flag when tf 1.0 testing ends.
   # Eager is default in tf 2.0 and should not be toggled
-  if not keras_common.is_v2_0():
+  if keras_common.is_v2_0():
+    keras_common.set_config_v2()
+  else:
+    config = keras_common.get_config_proto_v1()
     if flags_obj.enable_eager:
       tf.compat.v1.enable_eager_execution(config=config)
     else:
       sess = tf.Session(config=config)
       tf.keras.backend.set_session(sess)
-  # TODO(haoyuzhang): Set config properly in TF2.0 when the config API is ready.
+
+  # Execute flag override logic for better model performance
+  if flags_obj.tf_gpu_thread_mode:
+    keras_common.set_gpu_thread_mode_and_count(flags_obj)
 
   dtype = flags_core.get_tf_dtype(flags_obj)
-  if dtype == 'fp16':
-    raise ValueError('dtype fp16 is not supported in Keras. Use the default '
-                     'value(fp32).')
+  if dtype == 'float16':
+    policy = tf.keras.mixed_precision.experimental.Policy('infer_float32_vars')
+    tf.keras.mixed_precision.experimental.set_policy(policy)
 
   data_format = flags_obj.data_format
   if data_format is None:
@@ -120,7 +126,7 @@ def run(flags_obj):
         width=imagenet_main.DEFAULT_IMAGE_SIZE,
         num_channels=imagenet_main.NUM_CHANNELS,
         num_classes=imagenet_main.NUM_CLASSES,
-        dtype=flags_core.get_tf_dtype(flags_obj))
+        dtype=dtype)
   else:
     distribution_utils.undo_set_up_synthetic_data()
     input_fn = imagenet_main.input_fn
@@ -131,24 +137,35 @@ def run(flags_obj):
       batch_size=flags_obj.batch_size,
       num_epochs=flags_obj.train_epochs,
       parse_record_fn=parse_record_keras,
-      datasets_num_private_threads=flags_obj.datasets_num_private_threads)
+      datasets_num_private_threads=flags_obj.datasets_num_private_threads,
+      dtype=dtype)
 
-  eval_input_dataset = input_fn(
-      is_training=False,
-      data_dir=flags_obj.data_dir,
-      batch_size=flags_obj.batch_size,
-      num_epochs=flags_obj.train_epochs,
-      parse_record_fn=parse_record_keras)
+  eval_input_dataset = None
+  if not flags_obj.skip_eval:
+    eval_input_dataset = input_fn(
+        is_training=False,
+        data_dir=flags_obj.data_dir,
+        batch_size=flags_obj.batch_size,
+        num_epochs=flags_obj.train_epochs,
+        parse_record_fn=parse_record_keras,
+        dtype=dtype)
 
   strategy = distribution_utils.get_distribution_strategy(
       distribution_strategy=flags_obj.distribution_strategy,
-      num_gpus=flags_obj.num_gpus)
+      num_gpus=flags_obj.num_gpus,
+      num_workers=distribution_utils.configure_cluster())
 
   strategy_scope = keras_common.get_strategy_scope(strategy)
 
   with strategy_scope:
     optimizer = keras_common.get_optimizer()
-    model = resnet_model.resnet50(num_classes=imagenet_main.NUM_CLASSES)
+    if dtype == 'float16':
+      # TODO(reedwm): Remove manually wrapping optimizer once mixed precision
+      # can be enabled with a single line of code.
+      optimizer = tf.keras.mixed_precision.experimental.LossScaleOptimizer(
+          optimizer, loss_scale=flags_core.get_loss_scale(flags_obj))
+    model = resnet_model.resnet50(num_classes=imagenet_main.NUM_CLASSES,
+                                  dtype=dtype)
 
     model.compile(loss='sparse_categorical_crossentropy',
                   optimizer=optimizer,
@@ -176,14 +193,14 @@ def run(flags_obj):
     num_eval_steps = None
     validation_data = None
 
+  callbacks = [time_callback, lr_callback]
+  if flags_obj.enable_tensorboard:
+    callbacks.append(tensorboard_callback)
+
   history = model.fit(train_input_dataset,
                       epochs=train_epochs,
                       steps_per_epoch=train_steps,
-                      callbacks=[
-                          time_callback,
-                          lr_callback,
-                          tensorboard_callback
-                      ],
+                      callbacks=callbacks,
                       validation_steps=num_eval_steps,
                       validation_data=validation_data,
                       validation_freq=flags_obj.epochs_between_evals,
@@ -199,6 +216,7 @@ def run(flags_obj):
 
 
 def main(_):
+  model_helpers.apply_clean(flags.FLAGS)
   with logger.benchmark_context(flags.FLAGS):
     return run(flags.FLAGS)
 
